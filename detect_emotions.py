@@ -8,6 +8,7 @@ from torchvision import transforms
 from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from tqdm import tqdm
 
 # Constants
 IMG_SIZE = 48
@@ -187,6 +188,25 @@ def process_frame(frame, model, face_cascade, device):
     
     return frame, results
 
+def apply_previous_results(frame, previous_results):
+    """Apply face detection results from a previous frame to the current frame"""
+    if not previous_results:
+        return frame
+    
+    for result in previous_results:
+        x, y, w, h = result['bbox']
+        emotion = result['emotion']
+        probs = result['probabilities']
+        color = EMOTION_COLORS[emotion]
+        
+        # Draw rectangle and emotion text
+        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+        emotion_text = f"{EMOTIONS[emotion]}: {probs[emotion]*100:.1f}%"
+        cv2.putText(frame, emotion_text, (x, y-10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+    
+    return frame
+
 def process_video(video_path, model, device, output_path=None, sample_rate=15, display=True):
     """Process video file for emotion detection"""
     cap = cv2.VideoCapture(video_path)
@@ -217,6 +237,10 @@ def process_video(video_path, model, device, output_path=None, sample_rate=15, d
     
     frame_count = 0
     processed_count = 0
+    previous_results = []  # Store the most recent detection results
+    
+    # Create a tqdm progress bar
+    pbar = tqdm(total=total_frames, desc="Processing video", unit="frames")
     
     try:
         while cap.isOpened():
@@ -229,10 +253,10 @@ def process_video(video_path, model, device, output_path=None, sample_rate=15, d
                 # Process the frame for emotion detection
                 processed_frame, results = process_frame(frame.copy(), model, face_cascade, device)
                 processed_count += 1
+                previous_results = results  # Store results for unprocessed frames
                 
-                # Display progress
-                progress = (frame_count / total_frames) * 100
-                print(f"\rProcessing: {progress:.1f}% complete - Found {len(results)} faces in frame {frame_count}", end="")
+                # Add number of detected faces to progress bar description
+                pbar.set_postfix({"Detected faces": len(results)})
                 
                 # Display the processed frame if requested
                 if display:
@@ -244,22 +268,27 @@ def process_video(video_path, model, device, output_path=None, sample_rate=15, d
                 if out:
                     out.write(processed_frame)
             else:
-                # For unprocessed frames, just write the original frame to maintain timing
-                if out:
-                    out.write(frame)
+                # For unprocessed frames, apply the previous results to maintain consistent visualization
+                annotated_frame = apply_previous_results(frame.copy(), previous_results)
                 
-                # Optionally display unprocessed frames
+                # Display the frame with previous detection results
                 if display:
-                    cv2.imshow('Emotion Detection', frame)
+                    cv2.imshow('Emotion Detection', annotated_frame)
                     if cv2.waitKey(1) & 0xFF == ord('q'):  # Press 'q' to quit
                         break
+                
+                # Write the frame with previous detection results
+                if out:
+                    out.write(annotated_frame)
             
             frame_count += 1
+            pbar.update(1)  # Update progress bar
     
     except KeyboardInterrupt:
         print("\nProcessing interrupted by user.")
     
     finally:
+        pbar.close()  # Close the progress bar
         print(f"\nProcessed {processed_count} frames out of {frame_count} total frames")
         print(f"All {frame_count} frames were included in the output video")
         cap.release()

@@ -13,7 +13,7 @@ from tqdm import tqdm
 # Constants from detect_emotions.py
 IMG_SIZE = 48
 NUM_CLASSES = 7
-DEVICE = torch.device('cuda') # "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = torch.device('cpu') # "cuda" if torch.cuda.is_available() else "cpu"
 
 # Emotion labels and colors
 EMOTIONS = {0: "Angry", 1: "Disgust", 2: "Fear", 3: "Happy", 4: "Sad", 5: "Surprise", 6: "Neutral"}
@@ -149,7 +149,7 @@ def process_frame_with_tracking(frame, detector, predictor, emotion_model, devic
                 )
                 all_faces.append(adjusted_face)
         
-        # Only do full frame detection if no faces found in ROIs
+        # Do full frame detection if no faces found in ROIs
         if not all_faces:
             all_faces = detector(gray)
     else:
@@ -201,6 +201,39 @@ def process_frame_with_tracking(frame, detector, predictor, emotion_model, devic
     
     return frame, results
 
+def apply_previous_detections(current_frame, previous_frame, previous_results):
+    """Apply previous face detections to the current frame by copying face regions."""
+    if not previous_results:
+        return current_frame
+    
+    # Create a copy of the current frame to work on
+    result_frame = current_frame.copy()
+    
+    for result in previous_results:
+        x, y, w, h = result['bbox']
+        emotion = result['emotion']
+        probs = result['probabilities']
+        
+        # Define the face region
+        face_region = (slice(y, y+h), slice(x, x+w))
+        
+        # For visualization purposes, we'll still draw the rectangle and emotion text on the new frame
+        color = EMOTION_COLORS[emotion]
+        cv2.rectangle(result_frame, (x, y), (x+w, y+h), color, 2)
+        emotion_text = f"{EMOTIONS[emotion]}: {probs[emotion]*100:.1f}%"
+        cv2.putText(result_frame, emotion_text, (x, y-10),
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+        
+        # Draw landmarks if available
+        if 'landmarks' in result:
+            landmarks = result['landmarks']
+            for i in range(68):
+                landmark_x = landmarks.part(i).x
+                landmark_y = landmarks.part(i).y
+                cv2.circle(result_frame, (landmark_x, landmark_y), 1, (0, 255, 0), -1)
+    
+    return result_frame
+
 # Process video with dlib face detection and emotion recognition
 def process_video(video_path, emotion_model, device, output_path=None, sample_rate=15, display=True, draw_landmarks=False):
     """Process video file for emotion detection using dlib"""
@@ -242,6 +275,7 @@ def process_video(video_path, emotion_model, device, output_path=None, sample_ra
     processed_count = 0
     previous_results = []  # Store the most recent detection results
     previous_face_regions = []  # Store previous face regions
+    last_processed_frame = None  # Store the last processed frame
     
     # Create a progress bar
     pbar = tqdm(total=total_frames, desc="Processing video", unit="frames")
@@ -260,6 +294,7 @@ def process_video(video_path, emotion_model, device, output_path=None, sample_ra
                 )
                 processed_count += 1
                 previous_results = results
+                last_processed_frame = processed_frame.copy()
                 
                 # Update previous_face_regions for the next frame
                 previous_face_regions = [(r['bbox'][0], r['bbox'][1], 
@@ -280,38 +315,30 @@ def process_video(video_path, emotion_model, device, output_path=None, sample_ra
                 if out:
                     out.write(processed_frame)
             else:
-                # For unprocessed frames, use previous results
-                annotated_frame = frame.copy()
-                
-                for result in previous_results:
-                    x, y, w, h = result['bbox']
-                    emotion = result['emotion']
-                    probs = result['probabilities']
-                    color = EMOTION_COLORS[emotion]
+                # For unprocessed frames, apply the previous results more smoothly
+                if last_processed_frame is not None:
+                    # Apply the previous detections to the current frame
+                    annotated_frame = apply_previous_detections(
+                        frame.copy(), last_processed_frame, previous_results
+                    )
                     
-                    # Draw rectangle and emotion
-                    cv2.rectangle(annotated_frame, (x, y), (x+w, y+h), color, 2)
-                    emotion_text = f"{EMOTIONS[emotion]}: {probs[emotion]*100:.1f}%"
-                    cv2.putText(annotated_frame, emotion_text, (x, y-10),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                    # Display if requested
+                    if display:
+                        cv2.imshow('Facial Emotion Analysis', annotated_frame)
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            break
                     
-                    # Optionally draw landmarks if available and requested
-                    if draw_landmarks and 'landmarks' in result:
-                        landmarks = result['landmarks']
-                        for i in range(68):
-                            landmark_x = landmarks.part(i).x
-                            landmark_y = landmarks.part(i).y
-                            cv2.circle(annotated_frame, (landmark_x, landmark_y), 1, (0, 255, 0), -1)
-                
-                # Display if requested
-                if display:
-                    cv2.imshow('Facial Emotion Analysis', annotated_frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
-                
-                # Write to output
-                if out:
-                    out.write(annotated_frame)
+                    # Write to output
+                    if out:
+                        out.write(annotated_frame)
+                else:
+                    # If we don't have a processed frame yet, just write the original frame
+                    if display:
+                        cv2.imshow('Facial Emotion Analysis', frame)
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            break
+                    if out:
+                        out.write(frame)
             
             frame_count += 1
             pbar.update(1)

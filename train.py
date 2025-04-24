@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -11,6 +12,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import argparse
 
 # Set seeds for reproducibility
 torch.manual_seed(42)
@@ -196,6 +198,7 @@ def validate(model, val_loader, criterion, device):
 def train_fer2013_resnet():
     # Make sure the directory exists for model checkpoints
     os.makedirs('models', exist_ok=True)
+    start_time = time.time()
     
     # Load the dataset
     csv_path = 'train.csv'  # Adjust path if needed
@@ -289,6 +292,12 @@ def train_fer2013_resnet():
     plt.tight_layout()
     plt.savefig('fer2013_resnet_training.png')
     plt.show()
+    
+    # report total elapsed time
+    elapsed = time.time() - start_time
+    hrs, rem = divmod(elapsed, 3600)
+    mins, secs = divmod(rem, 60)
+    print(f"Total training time: {int(hrs)}h {int(mins)}m {secs:.2f}s")
     
     return model
 

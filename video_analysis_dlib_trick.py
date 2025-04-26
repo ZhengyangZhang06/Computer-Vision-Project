@@ -107,23 +107,43 @@ def predict_emotion(model, face_tensor, device):
     return predicted.item(), probs.cpu().numpy()[0]
 
 # Function to detect faces using dlib and predict emotions
-def process_frame_with_tracking(frame, detector, predictor, emotion_model, device, previous_face_regions):
+def process_frame_with_tracking(frame, detector, predictor, emotion_model, device, previous_face_regions, suggested_scale_factor=None):
     """Process a frame using face tracking based on previous face locations"""
+    # Calculate dynamic scale_factor to resize frame to 480p height
+    target_height = 480
+    frame_height = frame.shape[0]
+    frame_width = frame.shape[1]
+    frame_area = frame_height * frame_width
+    
+    # Use suggested scale factor if provided and in pre, have faces detected, otherwise calculate a new one
+    if suggested_scale_factor is not None and previous_face_regions:
+        scale_factor = suggested_scale_factor
+    else:
+        scale_factor = min(1.0, target_height / frame_height)  # Don't upscale small frames
+    
+    # Apply scale factor if significant
+    if scale_factor < 0.8: # only resize if the frame is not too near to 480p
+        small_frame = cv2.resize(frame, (0, 0), fx=scale_factor, fy=scale_factor)
+    else:
+        scale_factor = 1.0
+        small_frame = frame.copy()
+    gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     results = []
     frame_height, frame_width = gray.shape
     
     # Check if we have previous face regions to use for targeted detection
     if previous_face_regions:
-        all_faces = []
+        all_small_faces = []
         
         # Process each previous face region with padding
         for prev_face in previous_face_regions:
             x1, y1, x2, y2 = prev_face
             
-            # Add padding around previous face location (50 pixels in each direction)
-            pad = 50
+						# Calculate dynamic padding based on face size (30% of face dimensions)
+            face_width = abs(x2 - x1)
+            face_height = abs(y2 - y1)
+            pad = max(30, int(1.0 * max(face_width, face_height)))
             x1_padded = max(0, x1 - pad)
             y1_padded = max(0, y1 - pad)
             x2_padded = min(frame_width, x2 + pad)
@@ -147,14 +167,24 @@ def process_frame_with_tracking(frame, detector, predictor, emotion_model, devic
                     face.right() + x1_padded,
                     face.bottom() + y1_padded
                 )
-                all_faces.append(adjusted_face)
+                all_small_faces.append(adjusted_face)
         
-        # Do full frame detection if no faces found in ROIs
-        if not all_faces:
-            all_faces = detector(gray)
+        # Don't do full frame detection if no faces found in ROIs since we think when this happens, the face is not in the frame anymore, and new faces are into the frame, in the next detection, we will do full frame detection. So we only loss the first frame of the new faces.
+        #if not all_faces:
+        #    all_faces = detector(gray)
     else:
         # No previous faces, so we need to do full frame detection
-        all_faces = detector(gray)
+        all_small_faces = detector(gray)
+    """
+    # directly do full frame detection
+    all_small_faces = detector(gray)"""
+    all_faces = []
+    for face in all_small_faces:
+        x1 = int(face.left() / scale_factor)
+        y1 = int(face.top() / scale_factor)
+        x2 = int(face.right() / scale_factor)
+        y2 = int(face.bottom() / scale_factor)
+        all_faces.append(dlib.rectangle(x1, y1, x2, y2))
     
     # Process each detected face
     for face in all_faces:
@@ -162,8 +192,15 @@ def process_frame_with_tracking(frame, detector, predictor, emotion_model, devic
         x, y = face.left(), face.top()
         w, h = face.width(), face.height()
         
-        # Get facial landmarks
-        landmarks = predictor(gray, face)
+        # Get facial landmarks - but we need to do this in the scaled coordinates
+        # Create a scaled face for landmarks detection
+        scaled_face = dlib.rectangle(
+            int(x * scale_factor), 
+            int(y * scale_factor),
+            int((x+w) * scale_factor),
+            int((y+h) * scale_factor)
+        )
+        landmarks = predictor(gray, scaled_face)
         
         # Extract the face region
         face_region = frame_rgb[y:y+h, x:x+w]
@@ -181,7 +218,8 @@ def process_frame_with_tracking(frame, detector, predictor, emotion_model, devic
             'bbox': (x, y, w, h),
             'emotion': emotion,
             'probabilities': probs,
-            'landmarks': landmarks
+            'landmarks': landmarks,
+            'scale_factor': scale_factor
         })
         
         # Draw rectangle and emotion on the frame
@@ -195,11 +233,38 @@ def process_frame_with_tracking(frame, detector, predictor, emotion_model, devic
         
         # Draw facial landmarks
         for i in range(68):
-            landmark_x = landmarks.part(i).x
-            landmark_y = landmarks.part(i).y
+            # The landmarks are in the small frame's coordinate space, so we need to convert them back
+            landmark_x = int(landmarks.part(i).x / scale_factor)
+            landmark_y = int(landmarks.part(i).y / scale_factor)
             cv2.circle(frame, (landmark_x, landmark_y), 1, (0, 255, 0), -1)
     
-    return frame, results
+    # After processing all faces, calculate new scale factor for next frame
+    next_scale_factor = scale_factor
+    if all_faces:  # Only if we detected faces
+        total_face_area = 0
+        face_resolution_sufficient = False
+        
+        # Calculate total face area and check if any face has sufficient resolution
+        for face in all_faces:
+            w, h = face.width(), face.height()
+            face_area = w * h
+            total_face_area += face_area
+            
+            # Check if face has resolution greater than 96x96
+            if w > 96 and h > 96:
+                face_resolution_sufficient = True
+        
+        # Calculate ratio of total face area to frame area
+        face_to_frame_ratio = total_face_area / frame_area
+        
+        # If faces occupy significant space (>15%) and have sufficient resolution,
+        # increase scale factor to reduce resolution in next frame
+        if face_to_frame_ratio > 0.05 and face_resolution_sufficient:
+            next_scale_factor = scale_factor * 0.5  # Reduce resolution by 50%
+            print(f"Reducing scale factor to {next_scale_factor:.2f} based on face area")
+            next_scale_factor = min(0.8, next_scale_factor)  # Don't reduce too much
+    
+    return frame, results, next_scale_factor
 
 def apply_previous_detections(current_frame, previous_frame, previous_results):
     """Apply previous face detections to the current frame by copying face regions."""
@@ -227,9 +292,11 @@ def apply_previous_detections(current_frame, previous_frame, previous_results):
         # Draw landmarks if available
         if 'landmarks' in result:
             landmarks = result['landmarks']
+            scale_factor = result['scale_factor']
             for i in range(68):
-                landmark_x = landmarks.part(i).x
-                landmark_y = landmarks.part(i).y
+                # We already computed the correct coordinates when storing the landmarks
+                landmark_x = int(landmarks.part(i).x / scale_factor)
+                landmark_y = int(landmarks.part(i).y / scale_factor)
                 cv2.circle(result_frame, (landmark_x, landmark_y), 1, (0, 255, 0), -1)
     
     return result_frame
@@ -276,6 +343,7 @@ def process_video(video_path, emotion_model, device, output_path=None, sample_ra
     previous_results = []  # Store the most recent detection results
     previous_face_regions = []  # Store previous face regions
     last_processed_frame = None  # Store the last processed frame
+    current_scale_factor = None  # Store the dynamic scale factor
     
     # Create a progress bar
     pbar = tqdm(total=total_frames, desc="Processing video", unit="frames")
@@ -289,9 +357,11 @@ def process_video(video_path, emotion_model, device, output_path=None, sample_ra
             # Decide whether to process this frame
             if frame_count % frame_step == 0:
                 # Process the frame with dlib face detection and emotion prediction
-                processed_frame, results = process_frame_with_tracking(
-                    frame.copy(), detector, predictor, emotion_model, device, previous_face_regions
+                processed_frame, results, next_scale_factor = process_frame_with_tracking(
+                    frame.copy(), detector, predictor, emotion_model, device, 
+                    previous_face_regions, current_scale_factor
                 )
+                current_scale_factor = next_scale_factor  # Update scale factor for next frame
                 processed_count += 1
                 previous_results = results
                 last_processed_frame = processed_frame.copy()
@@ -303,7 +373,7 @@ def process_video(video_path, emotion_model, device, output_path=None, sample_ra
                                         for r in results]
                 
                 # Update progress bar
-                pbar.set_postfix({"Detected faces": len(results)})
+                pbar.set_postfix({"Detected faces": len(results), "Scale": f"{current_scale_factor:.2f}"})
                 
                 # Display if requested
                 if display:

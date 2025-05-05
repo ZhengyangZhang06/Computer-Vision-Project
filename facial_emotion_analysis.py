@@ -107,25 +107,101 @@ def predict_emotion(model, face_tensor, device):
     return predicted.item(), probs.cpu().numpy()[0]
 
 # Function to detect faces using dlib and predict emotions
-def process_frame_with_dlib(frame, detector, predictor, emotion_model, device):
-    """Process a frame using dlib for face detection and predict emotions"""
-    # Convert the frame to RGB for dlib
+def process_frame_with_tracking(frame, detector, predictor, emotion_model, device, previous_face_regions):
+    """Process a frame using face tracking based on previous face locations"""
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    
-    # Convert to grayscale for face detection
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    
-    # Detect faces
-    faces = detector(gray)
     results = []
+    frame_height, frame_width = gray.shape
     
-    for face in faces:
-        # Get facial landmarks
-        landmarks = predictor(gray, face)
+    def detect_with_aspect_ratios(img, region=None):
+        """Try detecting faces with different aspect ratios"""
+        detected_faces = []
+        aspect_ratios = [(1, 1), (1, 1.3), (1.3, 1)]  # Original, height stretch, width stretch
+        original_shape = img.shape
         
+        for w_scale, h_scale in aspect_ratios:
+            # Skip original ratio if we already tried it
+            if w_scale == 1 and h_scale == 1 and detected_faces:
+                continue
+                
+            # Resize with the current aspect ratio
+            if w_scale != 1 or h_scale != 1:
+                new_width = int(img.shape[1] * w_scale)
+                new_height = int(img.shape[0] * h_scale)
+                resized = cv2.resize(img, (new_width, new_height))
+            else:
+                resized = img
+            
+            # Detect faces in the resized image
+            if region is None:
+                faces = detector(resized)
+            else:
+                faces = detector(resized)
+            
+            # If faces detected, convert coordinates back to original image space
+            if faces:
+                for face in faces:
+                    # Convert coordinates back to original scale
+                    scaled_face = dlib.rectangle(
+                        int(face.left() / w_scale),
+                        int(face.top() / h_scale),
+                        int(face.right() / w_scale),
+                        int(face.bottom() / h_scale)
+                    )
+                    detected_faces.append(scaled_face)
+                
+                # Break after finding faces with an aspect ratio
+                break
+                
+        return detected_faces
+    
+    # Check if we have previous face regions to use for targeted detection
+    all_faces = []
+    if previous_face_regions:
+        # Process each previous face region with padding
+        for prev_face in previous_face_regions:
+            x1, y1, x2, y2 = prev_face
+            
+            # Add padding around previous face location (50 pixels in each direction)
+            pad = 50
+            x1_padded = max(0, x1 - pad)
+            y1_padded = max(0, y1 - pad)
+            x2_padded = min(frame_width, x2 + pad)
+            y2_padded = min(frame_height, y2 + pad)
+            
+            # Extract region of interest
+            roi = gray[y1_padded:y2_padded, x1_padded:x2_padded]
+            
+            # Skip if ROI is empty
+            if roi.size == 0:
+                continue
+                
+            # Try detection with different aspect ratios in this region
+            faces_in_roi = detect_with_aspect_ratios(roi)
+            
+            # Adjust coordinates back to full frame
+            for face in faces_in_roi:
+                adjusted_face = dlib.rectangle(
+                    face.left() + x1_padded,
+                    face.top() + y1_padded,
+                    face.right() + x1_padded,
+                    face.bottom() + y1_padded
+                )
+                all_faces.append(adjusted_face)
+    
+    # If no faces found in ROIs, try full frame detection with different aspect ratios
+    if not all_faces:
+        all_faces = detect_with_aspect_ratios(gray)
+    
+    # Process each detected face
+    for face in all_faces:
         # Convert dlib rectangle to OpenCV rectangle format
         x, y = face.left(), face.top()
         w, h = face.width(), face.height()
+        
+        # Get facial landmarks
+        landmarks = predictor(gray, face)
         
         # Extract the face region
         face_region = frame_rgb[y:y+h, x:x+w]
@@ -155,7 +231,7 @@ def process_frame_with_dlib(frame, detector, predictor, emotion_model, device):
         cv2.putText(frame, emotion_text, (x, y-10),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
         
-        # Optionally draw facial landmarks
+        # Draw facial landmarks
         for i in range(68):
             landmark_x = landmarks.part(i).x
             landmark_y = landmarks.part(i).y
@@ -203,6 +279,7 @@ def process_video(video_path, emotion_model, device, output_path=None, sample_ra
     frame_count = 0
     processed_count = 0
     previous_results = []  # Store the most recent detection results
+    previous_face_regions = []  # Store previous face regions
     
     # Create a progress bar
     pbar = tqdm(total=total_frames, desc="Processing video", unit="frames")
@@ -216,11 +293,17 @@ def process_video(video_path, emotion_model, device, output_path=None, sample_ra
             # Decide whether to process this frame
             if frame_count % frame_step == 0:
                 # Process the frame with dlib face detection and emotion prediction
-                processed_frame, results = process_frame_with_dlib(
-                    frame.copy(), detector, predictor, emotion_model, device
+                processed_frame, results = process_frame_with_tracking(
+                    frame.copy(), detector, predictor, emotion_model, device, previous_face_regions
                 )
                 processed_count += 1
                 previous_results = results
+                
+                # Update previous_face_regions for the next frame
+                previous_face_regions = [(r['bbox'][0], r['bbox'][1], 
+                                         r['bbox'][0] + r['bbox'][2], 
+                                         r['bbox'][1] + r['bbox'][3]) 
+                                        for r in results]
                 
                 # Update progress bar
                 pbar.set_postfix({"Detected faces": len(results)})

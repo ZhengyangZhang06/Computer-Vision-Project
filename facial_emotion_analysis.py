@@ -9,6 +9,7 @@ from PIL import Image
 import os
 import argparse
 from tqdm import tqdm
+import onnxruntime as ort
 
 # Constants from detect_emotions.py
 IMG_SIZE = 48
@@ -106,105 +107,125 @@ def predict_emotion(model, face_tensor, device):
         _, predicted = torch.max(outputs, 1)
     return predicted.item(), probs.cpu().numpy()[0]
 
-# Function to detect faces using dlib and predict emotions
-def process_frame_with_tracking(frame, detector, predictor, emotion_model, device, previous_face_regions):
-    """Process a frame using face tracking based on previous face locations"""
+# ONNX Face detection utilities
+def predict_faces(width, height, confidences, boxes, prob_threshold=0.7, iou_threshold=0.3, top_k=-1):
+    """Process raw ONNX model output to get face bounding boxes"""
+    boxes = boxes[0]
+    confidences = confidences[0]
+    picked_box_probs = []
+    picked_labels = []
+    
+    for class_index in range(1, confidences.shape[1]):
+        probs = confidences[:, class_index]
+        mask = probs > prob_threshold
+        probs = probs[mask]
+        
+        if probs.shape[0] == 0:
+            continue
+            
+        subset_boxes = boxes[mask, :]
+        box_probs = np.concatenate([subset_boxes, probs.reshape(-1, 1)], axis=1)
+        
+        # Apply non-maximum suppression
+        keep = nms(box_probs, iou_threshold)
+        if keep.shape[0] > 0:
+            box_probs = box_probs[keep, :]
+            
+        if top_k > 0:
+            if box_probs.shape[0] > top_k:
+                box_probs = box_probs[:top_k, :]
+                
+        picked_box_probs.append(box_probs)
+        picked_labels.extend([class_index] * box_probs.shape[0])
+        
+    if not picked_box_probs:
+        return np.array([]), np.array([]), np.array([])
+        
+    picked_box_probs = np.concatenate(picked_box_probs)
+    
+    # Convert normalized coordinates to image dimensions
+    picked_box_probs[:, 0] *= width
+    picked_box_probs[:, 1] *= height
+    picked_box_probs[:, 2] *= width
+    picked_box_probs[:, 3] *= height
+    
+    return picked_box_probs[:, :4].astype(np.int32), np.array(picked_labels), picked_box_probs[:, 4]
+
+def nms(box_probs, iou_threshold=0.3, top_k=-1):
+    """Non-maximum suppression"""
+    keep = []
+    
+    # Sort boxes by confidence
+    order = np.argsort(box_probs[:, 4])[::-1]
+    
+    # Apply NMS
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        
+        if top_k > 0 and len(keep) >= top_k:
+            break
+            
+        xx1 = np.maximum(box_probs[i, 0], box_probs[order[1:], 0])
+        yy1 = np.maximum(box_probs[i, 1], box_probs[order[1:], 1])
+        xx2 = np.minimum(box_probs[i, 2], box_probs[order[1:], 2])
+        yy2 = np.minimum(box_probs[i, 3], box_probs[order[1:], 3])
+        
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        
+        intersection = w * h
+        union = (box_probs[i, 2] - box_probs[i, 0]) * (box_probs[i, 3] - box_probs[i, 1]) + \
+                (box_probs[order[1:], 2] - box_probs[order[1:], 0]) * \
+                (box_probs[order[1:], 3] - box_probs[order[1:], 1]) - intersection
+        
+        iou = intersection / np.maximum(union, 1e-10)
+        mask = iou <= iou_threshold
+        
+        order = order[1:][mask]
+        
+    return np.array(keep)
+
+# Function to detect faces using ONNX model and predict emotions
+def process_frame_with_onnx(frame, face_detector, ort_session, input_name, predictor, emotion_model, device, previous_face_regions):
+    """Process a frame using ONNX face detection and emotion prediction"""
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     results = []
-    frame_height, frame_width = gray.shape
     
-    def detect_with_aspect_ratios(img, region=None):
-        """Try detecting faces with different aspect ratios"""
-        detected_faces = []
-        aspect_ratios = [(1, 1), (1, 1.3), (1.3, 1)]  # Original, height stretch, width stretch
-        original_shape = img.shape
-        
-        for w_scale, h_scale in aspect_ratios:
-            # Skip original ratio if we already tried it
-            if w_scale == 1 and h_scale == 1 and detected_faces:
-                continue
-                
-            # Resize with the current aspect ratio
-            if w_scale != 1 or h_scale != 1:
-                new_width = int(img.shape[1] * w_scale)
-                new_height = int(img.shape[0] * h_scale)
-                resized = cv2.resize(img, (new_width, new_height))
-            else:
-                resized = img
-            
-            # Detect faces in the resized image
-            if region is None:
-                faces = detector(resized)
-            else:
-                faces = detector(resized)
-            
-            # If faces detected, convert coordinates back to original image space
-            if faces:
-                for face in faces:
-                    # Convert coordinates back to original scale
-                    scaled_face = dlib.rectangle(
-                        int(face.left() / w_scale),
-                        int(face.top() / h_scale),
-                        int(face.right() / w_scale),
-                        int(face.bottom() / h_scale)
-                    )
-                    detected_faces.append(scaled_face)
-                
-                # Break after finding faces with an aspect ratio
-                break
-                
-        return detected_faces
+    # Get frame dimensions
+    height, width = frame.shape[:2]
     
-    # Check if we have previous face regions to use for targeted detection
-    all_faces = []
-    if previous_face_regions:
-        # Process each previous face region with padding
-        for prev_face in previous_face_regions:
-            x1, y1, x2, y2 = prev_face
-            
-            # Add padding around previous face location (50 pixels in each direction)
-            pad = 50
-            x1_padded = max(0, x1 - pad)
-            y1_padded = max(0, y1 - pad)
-            x2_padded = min(frame_width, x2 + pad)
-            y2_padded = min(frame_height, y2 + pad)
-            
-            # Extract region of interest
-            roi = gray[y1_padded:y2_padded, x1_padded:x2_padded]
-            
-            # Skip if ROI is empty
-            if roi.size == 0:
-                continue
-                
-            # Try detection with different aspect ratios in this region
-            faces_in_roi = detect_with_aspect_ratios(roi)
-            
-            # Adjust coordinates back to full frame
-            for face in faces_in_roi:
-                adjusted_face = dlib.rectangle(
-                    face.left() + x1_padded,
-                    face.top() + y1_padded,
-                    face.right() + x1_padded,
-                    face.bottom() + y1_padded
-                )
-                all_faces.append(adjusted_face)
+    # Preprocess image for ONNX face detection
+    input_width = 320
+    input_height = 240  # Changed from 320 to 240
+    image = cv2.resize(frame_rgb, (input_width, input_height))
+    image_mean = np.array([127, 127, 127])
+    image = (image - image_mean) / 128
+    image = np.transpose(image, [2, 0, 1])
+    image = np.expand_dims(image, axis=0)
+    image = image.astype(np.float32)
     
-    # If no faces found in ROIs, try full frame detection with different aspect ratios
-    if not all_faces:
-        all_faces = detect_with_aspect_ratios(gray)
+    # Run ONNX inference
+    confidences, boxes = ort_session.run(None, {input_name: image})
+    
+    # Process the output to get face bounding boxes
+    face_boxes, _, face_probs = predict_faces(width, height, confidences, boxes, prob_threshold=0.6)
     
     # Process each detected face
-    for face in all_faces:
-        # Convert dlib rectangle to OpenCV rectangle format
-        x, y = face.left(), face.top()
-        w, h = face.width(), face.height()
+    for i in range(len(face_boxes)):
+        x1, y1, x2, y2 = face_boxes[i]
+        w, h = x2 - x1, y2 - y1
         
-        # Get facial landmarks
-        landmarks = predictor(gray, face)
+        # Extract face region for landmark detection
+        # Convert ONNX detection to dlib rectangle format for landmark prediction
+        face_rect = dlib.rectangle(left=x1, top=y1, right=x2, bottom=y2)
         
-        # Extract the face region
-        face_region = frame_rgb[y:y+h, x:x+w]
+        # Get facial landmarks using dlib predictor
+        landmarks = predictor(gray, face_rect)
+        
+        # Extract the face region for emotion prediction
+        face_region = frame_rgb[y1:y2, x1:x2]
         
         # Skip if face region is empty
         if face_region.size == 0:
@@ -216,19 +237,20 @@ def process_frame_with_tracking(frame, detector, predictor, emotion_model, devic
         
         # Store results
         results.append({
-            'bbox': (x, y, w, h),
+            'bbox': (x1, y1, w, h),
             'emotion': emotion,
             'probabilities': probs,
-            'landmarks': landmarks
+            'landmarks': landmarks,
+            'confidence': float(face_probs[i])
         })
         
         # Draw rectangle and emotion on the frame
         color = EMOTION_COLORS[emotion]
-        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         
         # Add emotion text with percentage
         emotion_text = f"{EMOTIONS[emotion]}: {probs[emotion]*100:.1f}%"
-        cv2.putText(frame, emotion_text, (x, y-10),
+        cv2.putText(frame, emotion_text, (x1, y1-10),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
         
         # Draw facial landmarks
@@ -239,13 +261,39 @@ def process_frame_with_tracking(frame, detector, predictor, emotion_model, devic
     
     return frame, results
 
-# Process video with dlib face detection and emotion recognition
-def process_video(video_path, emotion_model, device, output_path=None, sample_rate=15, display=True, draw_landmarks=False):
-    """Process video file for emotion detection using dlib"""
-    # Load face detector and landmark predictor from dlib
-    detector = dlib.get_frontal_face_detector()
-    predictor_path = "shape_predictor_68_face_landmarks.dat"
+# Process video with ONNX face detection and emotion recognition
+def process_video_with_onnx(video_path, emotion_model, device, output_path=None, sample_rate=15, display=True, draw_landmarks=False):
+    """Process video file for emotion detection using ONNX face detection"""
+    # Load ONNX face detection model
+    onnx_path = None
     
+    # Try to find the ONNX model in common locations
+    model_dirs = [
+        ".",
+        "./models/onnx",
+        "Ultra-Light-Fast-Generic-Face-Detector-1MB/models/onnx"
+    ]
+    
+    for model_dir in model_dirs:
+        for model_name in ["version-RFB-320.onnx", "version-slim-320.onnx"]:
+            path = os.path.join(model_dir, model_name)
+            if os.path.exists(path):
+                onnx_path = path
+                break
+        if onnx_path:
+            break
+    
+    if not onnx_path:
+        print("Error: Could not find ONNX face detection model")
+        print("Please specify the correct path to the ONNX model")
+        return
+    
+    print(f"Using ONNX face detection model: {onnx_path}")
+    ort_session = ort.InferenceSession(onnx_path)
+    input_name = ort_session.get_inputs()[0].name
+    
+    # Load dlib landmark predictor (still needed for landmark detection)
+    predictor_path = "shape_predictor_68_face_landmarks.dat"
     if not os.path.exists(predictor_path):
         print(f"Error: Landmark predictor file '{predictor_path}' not found.")
         print("Download from: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2")
@@ -292,9 +340,9 @@ def process_video(video_path, emotion_model, device, output_path=None, sample_ra
             
             # Decide whether to process this frame
             if frame_count % frame_step == 0:
-                # Process the frame with dlib face detection and emotion prediction
-                processed_frame, results = process_frame_with_tracking(
-                    frame.copy(), detector, predictor, emotion_model, device, previous_face_regions
+                # Process the frame with ONNX face detection and emotion prediction
+                processed_frame, results = process_frame_with_onnx(
+                    frame.copy(), None, ort_session, input_name, predictor, emotion_model, device, previous_face_regions
                 )
                 processed_count += 1
                 previous_results = results
@@ -367,7 +415,7 @@ def process_video(video_path, emotion_model, device, output_path=None, sample_ra
 
 def main():
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Facial Emotion Analysis on Video using dlib')
+    parser = argparse.ArgumentParser(description='Facial Emotion Analysis on Video using ONNX face detection')
     parser.add_argument('--video', help='Path to the input video file')
     parser.add_argument('--output', help='Path to save the output video (optional)')
     parser.add_argument('--sample_rate', type=int, default=15, help='Frames per second to process (default: 15)')
@@ -409,8 +457,8 @@ def main():
         display_option = input("Do you want to display video while processing? (y/n): ").strip().lower()
         display = display_option == 'y'
     
-    # Process the video
-    process_video(
+    # Process the video with ONNX face detection
+    process_video_with_onnx(
         video_path, 
         model, 
         DEVICE,
